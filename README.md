@@ -73,7 +73,7 @@ By default, the browser sends API calls to the frontend's own `/api` path, and t
 ## Prototype capabilities
 
 - Upload PDF, JPG, JPEG, or PNG files (15 MB each; PDFs are limited to 50 pages).
-- Run OCR and extract labelled fields with page, evidence text, extraction method, and source regions where available. EasyOCR confidence comes from the recognizer; fallback extraction scores are explicitly heuristic.
+- Run OCR and extract labelled fields with page, source document ID, evidence text, extraction method, and source regions where available. PDF labels can be associated with adjacent same-baseline or immediately below text regions using their coordinates. Per-field `extracted`/`not_extracted` status is explicit; a missing extraction does not establish that the source field is absent. EasyOCR confidence comes from the recognizer; fallback extraction scores are explicitly heuristic.
 - Extract common PAN and Aadhaar identifier labels as document-specific fields when they are present in text; the parser remains label-based and does not verify either identifier.
 - Classify documents by keyword evidence, expose the uncalibrated score, and save manual corrections.
 - Inspect text regions, page coordinates, headings, form-field labels, and possible table rows using layout heuristics.

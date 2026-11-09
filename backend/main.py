@@ -901,6 +901,33 @@ LABEL_LOOKUP = sorted(
     reverse=True
 )
 
+TRACEABLE_IDENTITY_FIELDS = (
+    "applicant_name",
+    "date_of_birth",
+    "document_number",
+    "address",
+    "gender",
+    "issue_date",
+    "expiry_date"
+)
+
+
+def build_field_extraction_status(fields):
+    return {
+        field_name: {
+            "status": "extracted" if fields.get(field_name) else "not_extracted",
+            "message": (
+                "Candidate value(s) were extracted and require source review."
+                if fields.get(field_name)
+                else (
+                    "No supported value was extracted; this does not establish "
+                    "that the field is absent from the source document."
+                )
+            )
+        }
+        for field_name in TRACEABLE_IDENTITY_FIELDS
+    }
+
 
 def find_evidence_region(page, value, evidence):
     normalized_value = re.sub(r"\s+", " ", str(value)).casefold()
@@ -920,8 +947,111 @@ def find_evidence_region(page, value, evidence):
     return None
 
 
+def merge_evidence_regions(regions):
+    regions = [region for region in regions if region.get("bbox")]
+    if not regions:
+        return None
+
+    boxes = [region["bbox"] for region in regions]
+    confidences = [
+        region["ocr_confidence"]
+        for region in regions
+        if region.get("ocr_confidence") is not None
+    ]
+    return {
+        "text": " ".join(region.get("text", "").strip() for region in regions),
+        "bbox": [
+            round(min(box[0] for box in boxes), 2),
+            round(min(box[1] for box in boxes), 2),
+            round(max(box[2] for box in boxes), 2),
+            round(max(box[3] for box in boxes), 2)
+        ],
+        "coordinate_system": regions[0].get("coordinate_system"),
+        "source": regions[0].get("source"),
+        "ocr_confidence": (
+            round(statistics.mean(confidences), 4) if confidences else None
+        )
+    }
+
+
+def find_adjacent_field_value(page, label):
+    regions = [
+        region
+        for region in page.get("regions", [])
+        if region.get("text") and region.get("bbox") and len(region["bbox"]) == 4
+    ]
+    normalized_label = re.sub(r"\s+", " ", label).strip().casefold()
+    label_regions = []
+    for region in regions:
+        normalized_text = re.sub(
+            r"\s+", " ", region["text"]
+        ).strip().casefold().rstrip(" :=-")
+        if normalized_text == normalized_label:
+            label_regions.append(region)
+
+    if not label_regions:
+        return None, None, None
+
+    label_region = min(
+        label_regions,
+        key=lambda region: (region["bbox"][1], region["bbox"][0])
+    )
+    label_box = label_region["bbox"]
+    label_center = (label_box[1] + label_box[3]) / 2
+    label_height = max(1, label_box[3] - label_box[1])
+    same_line_tolerance = max(3, min(label_height * 0.6, 8))
+    candidates = []
+
+    for region in regions:
+        if region is label_region or self_is_another_label(region["text"]):
+            continue
+        box = region["bbox"]
+        center = (box[1] + box[3]) / 2
+        if (
+            box[0] >= label_box[2] - 2
+            and abs(center - label_center) <= same_line_tolerance
+        ):
+            candidates.append(region)
+
+    if candidates:
+        candidates.sort(key=lambda region: region["bbox"][0])
+        return (
+            " ".join(region["text"].strip() for region in candidates).strip(),
+            merge_evidence_regions(candidates),
+            "adjacent_region_same_baseline"
+        )
+
+    below_candidates = []
+    for region in regions:
+        if region is label_region or self_is_another_label(region["text"]):
+            continue
+        box = region["bbox"]
+        gap = box[1] - label_box[3]
+        if -same_line_tolerance <= gap <= max(24, label_height * 1.5):
+            below_candidates.append(region)
+
+    if not below_candidates:
+        return None, None, None
+
+    nearest_top = min(region["bbox"][1] for region in below_candidates)
+    next_line_tolerance = max(3, min(label_height * 0.6, 8))
+    candidates = [
+        region for region in below_candidates
+        if abs(region["bbox"][1] - nearest_top) <= next_line_tolerance
+    ]
+    candidates.sort(key=lambda region: region["bbox"][0])
+    return (
+        " ".join(region["text"].strip() for region in candidates).strip(),
+        merge_evidence_regions(candidates),
+        "adjacent_region_below_label"
+    )
+
+
 def add_extracted_field(fields, field_name, value, page, method,
-                        evidence, confidence, evidence_region=None):
+                        evidence, confidence, evidence_region=None,
+                        document_id=None, association_method=None):
+    if value is None:
+        return
     value = str(value).strip().strip(" \t:=-,;.")
     if not value:
         return
@@ -953,6 +1083,10 @@ def add_extracted_field(fields, field_name, value, page, method,
             if evidence_region else None
         )
     }
+    if document_id is not None:
+        item["document_id"] = document_id
+    if association_method is not None:
+        item["association_method"] = association_method
 
     fields.setdefault(field_name, [])
 
@@ -967,7 +1101,7 @@ def add_extracted_field(fields, field_name, value, page, method,
         fields[field_name].append(item)
 
 
-def extract_structured_fields(page_texts):
+def extract_structured_fields(page_texts, document_id=None):
     """
     Extracts multiple occurrences of labelled fields, plus common patterns.
     It does not guess a person's name from arbitrary unlabelled text.
@@ -1005,15 +1139,12 @@ def extract_structured_fields(page_texts):
             if not line:
                 continue
 
-            # 1) Label and value on the same line:
-            #    "Student Name: Ravi Kumar"
-            #    "Student Name - Ravi Kumar"
             matched_label = False
 
             for label, field_name in LABEL_LOOKUP:
                 label_pattern = (
-                    r"^\s*" + re.escape(label) +
-                    r"\s*(?:[:=\-]\s*|\s{2,})(.*)$"
+                    r"^\s*" + re.escape(label)
+                    + r"(?:(?:\s*[:=\-]\s*(.*))|\s{2,}(.*))?\s*$"
                 )
 
                 match = re.match(
@@ -1021,18 +1152,26 @@ def extract_structured_fields(page_texts):
                 )
 
                 if match:
-                    value = match.group(1).strip()
-
-                    # 2) Some forms put the value on the next line.
+                    value = (match.group(1) or match.group(2) or "").strip()
+                    evidence = line
+                    evidence_region = None
+                    association_method = "same_line"
+                    if not value:
+                        value, evidence_region, association_method = (
+                            find_adjacent_field_value(page, label)
+                        )
+                        if value:
+                            evidence = line + " | " + value
                     if not value and index + 1 < len(lines):
                         next_line = lines[index + 1].strip()
-                        if next_line and not self_is_another_label(next_line):
+                        if (
+                            next_line
+                            and not self_is_another_label(next_line)
+                            and not page.get("regions")
+                        ):
                             value = next_line
                             evidence = line + " | " + next_line
-                        else:
-                            evidence = line
-                    else:
-                        evidence = line
+                            association_method = "adjacent_text_line"
 
                     add_extracted_field(
                         extracted_fields,
@@ -1042,7 +1181,14 @@ def extract_structured_fields(page_texts):
                         method,
                         evidence,
                         base_confidence,
-                        find_evidence_region(page, value, evidence)
+                        (
+                            evidence_region
+                            or find_evidence_region(page, value, evidence)
+                        ),
+                        document_id=document_id,
+                        association_method=(
+                            association_method if value else None
+                        )
                     )
                     matched_label = True
                     break
@@ -1063,7 +1209,8 @@ def extract_structured_fields(page_texts):
                     method,
                     value,
                     confidence if method == "pdf_text" else confidence - 0.15,
-                    find_evidence_region(page, value, value)
+                    find_evidence_region(page, value, value),
+                    document_id=document_id
                 )
 
     return extracted_fields
@@ -1071,11 +1218,12 @@ def extract_structured_fields(page_texts):
 
 def self_is_another_label(line):
     """Return True if a line appears to be another known field label."""
-    candidate = line.strip().lower().rstrip(":=- ")
+    candidate = re.sub(r"\s+", " ", line.strip()).casefold()
     return any(
-        candidate == label
-        or candidate.startswith(label + ":")
-        or candidate.startswith(label + " -")
+        re.match(
+            r"^\s*" + re.escape(label) + r"(?:\s*[:=\-]|\s{2,}|$)",
+            candidate
+        )
         for label, _field_name in LABEL_LOOKUP
     )
 
@@ -1573,7 +1721,10 @@ def structured_information_extraction(document_id: str):
         page_texts = extract_document_pages(file_path)
         full_text = "\n\n".join(page["text"] for page in page_texts)
 
-        extracted_fields = extract_structured_fields(page_texts)
+        extracted_fields = extract_structured_fields(
+            page_texts,
+            document_id=document_id
+        )
         predicted_classification = classify_document(full_text)
         document_record = ensure_document_record(document_id, file_path)
         classification_override = document_record["classification_override"]
@@ -1610,6 +1761,7 @@ def structured_information_extraction(document_id: str):
             "total_field_types": len(extracted_fields),
             "total_characters_processed": total_characters,
             "fields": extracted_fields,
+            "field_status": build_field_extraction_status(extracted_fields),
             "document_structure": build_document_structure(
                 page_texts, extracted_fields
             ),
@@ -2853,7 +3005,10 @@ def create_investigation(
     for document_id, file_path in file_paths.items():
         page_texts = extract_document_pages(file_path)
         full_text = "\n\n".join(page["text"] for page in page_texts)
-        fields = extract_structured_fields(page_texts)
+        fields = extract_structured_fields(
+            page_texts,
+            document_id=document_id
+        )
         predicted_classification = classify_document(full_text)
         document_record = forensic_database.get_document(document_id)
         classification_override = (
@@ -2898,6 +3053,7 @@ def create_investigation(
                     "confidence_basis": value["confidence_basis"],
                     "page": value["page"],
                     "method": value["method"],
+                    "association_method": value.get("association_method"),
                     "evidence_text": value["evidence"],
                     "bbox": value["bbox"],
                     "coordinate_system": value["coordinate_system"],
@@ -3045,6 +3201,7 @@ def create_investigation(
             "overview": overview,
             "extracted_information": {
                 "fields": fields,
+                "field_status": build_field_extraction_status(fields),
                 "status": (
                     "fields_detected" if fields
                     else "no_structured_fields_detected"
@@ -3277,6 +3434,7 @@ def create_investigation(
             {
                 "document_id": result["overview"]["document_id"],
                 "fields": result["extracted_information"]["fields"],
+                "field_status": result["extracted_information"]["field_status"],
                 "status": result["extracted_information"]["status"],
                 "message": result["extracted_information"]["message"],
                 "page_references": result["extracted_information"]["page_references"],
@@ -3361,6 +3519,29 @@ def create_investigation(
         item["document_id"]: item["source_filename"]
         for item in dossier["document_overview"]["documents"]
     }
+
+    def evidence_reference_key(reference):
+        excerpt = reference.get("text_excerpt") or reference.get(
+            "evidence_text"
+        )
+        return (
+            reference.get("document_id"),
+            reference.get("page"),
+            json.dumps(reference.get("bbox"), sort_keys=True),
+            reference.get("field"),
+            re.sub(r"\s+", " ", str(reference.get("value", ""))).strip().casefold(),
+            re.sub(r"\s+", " ", str(excerpt or "")).strip().casefold(),
+            reference.get("sha256"),
+            reference.get("image_xref")
+        )
+
+    known_reference_keys = {
+        document_id: {
+            evidence_reference_key(reference)
+            for reference in section["references"]
+        }
+        for document_id, section in evidence_sections.items()
+    }
     if (
         dossier["investigation_id"] != investigation_id
         or set(source_filenames) != submitted_ids
@@ -3406,6 +3587,12 @@ def create_investigation(
             evidence_sections[
                 referenced_document_id
             ]["finding_references"].append(finding_reference)
+            reference_key = evidence_reference_key(finding_reference)
+            if reference_key not in known_reference_keys[referenced_document_id]:
+                evidence_sections[referenced_document_id][
+                    "references"
+                ].append(finding_reference)
+                known_reference_keys[referenced_document_id].add(reference_key)
 
     dossier_path = REPORT_DIR / f"Investigation_Dossier_{investigation_id}.json"
     try:

@@ -874,7 +874,15 @@ class InvestigationTests(unittest.TestCase):
                 "Date of Birth: 01/01/1990",
                 "Aadhaar Number: 999988887777"
             ])
-            empty_content = synthetic_pdf(["Synthetic internal note only"])
+            empty_content = synthetic_pdf(
+                [
+                    "Synthetic internal note only",
+                    "No account record included",
+                    "Demonstration summary",
+                    "For investigation practice"
+                ],
+                prominent_disclaimer=True
+            )
 
             with (
                 patch.object(main, "UPLOAD_DIR", uploads),
@@ -958,6 +966,25 @@ class InvestigationTests(unittest.TestCase):
                     aadhaar_fields = extracted_by_id[
                         uploaded["fictional_aadhaar_sample.pdf"]
                     ]["fields"]
+                    for document_id in (
+                        uploaded["fictional_pan_sample.pdf"],
+                        uploaded["fictional_aadhaar_sample.pdf"]
+                    ):
+                        field_status = extracted_by_id[document_id][
+                            "field_status"
+                        ]
+                        self.assertEqual(
+                            field_status["applicant_name"]["status"],
+                            "extracted"
+                        )
+                        self.assertEqual(
+                            field_status["address"]["status"],
+                            "not_extracted"
+                        )
+                        self.assertIn(
+                            "does not establish",
+                            field_status["address"]["message"]
+                        )
                     self.assertEqual(
                         pan_fields["applicant_name"][0]["value"],
                         "Asha Example"
@@ -982,6 +1009,18 @@ class InvestigationTests(unittest.TestCase):
                                 self.assertEqual(value["page"], 1)
                                 self.assertIsNotNone(value["bbox"])
                                 self.assertTrue(value["coordinate_system"])
+                    for document_id in (
+                        uploaded["fictional_pan_sample.pdf"],
+                        uploaded["fictional_aadhaar_sample.pdf"]
+                    ):
+                        for values in extracted_by_id[document_id][
+                            "fields"
+                        ].values():
+                            for value in values:
+                                self.assertEqual(
+                                    value["document_id"],
+                                    document_id
+                                )
 
                     comparisons = {
                         row["field"]: row
@@ -1041,6 +1080,33 @@ class InvestigationTests(unittest.TestCase):
                             item["source_filename"],
                             overview_by_id[document_id]["source_filename"]
                         )
+                        reference_keys = [
+                            (
+                                reference.get("page"),
+                                tuple(reference.get("bbox") or []),
+                                reference.get("field"),
+                                reference.get("value"),
+                                reference.get("text_excerpt")
+                                or reference.get("evidence_text"),
+                                reference.get("sha256"),
+                                reference.get("image_xref")
+                            )
+                            for reference in item["references"]
+                        ]
+                        self.assertEqual(
+                            len(reference_keys),
+                            len(set(reference_keys))
+                        )
+                        for reference in item["references"]:
+                            self.assertEqual(
+                                reference["document_id"],
+                                document_id
+                            )
+                            self.assertTrue(
+                                reference.get("text_excerpt")
+                                or reference.get("evidence_text")
+                                or reference.get("sha256")
+                            )
                         for reference in item["finding_references"]:
                             linked_reference_count += 1
                             self.assertIn(reference["finding_id"], findings_by_id)
@@ -1104,6 +1170,33 @@ class InvestigationTests(unittest.TestCase):
                         empty_extraction["message"],
                         "No structured fields detected"
                     )
+                    self.assertTrue(all(
+                        status["status"] == "not_extracted"
+                        for status in empty_extraction["field_status"].values()
+                    ))
+                    empty_document_id = uploaded["fictional_no_fields.pdf"]
+                    empty_traceability = next(
+                        item
+                        for item in empty_dossier["evidence_and_traceability"]
+                        if item["document_id"] == empty_document_id
+                    )
+                    self.assertTrue(empty_traceability["references"])
+                    self.assertTrue(empty_traceability["finding_references"])
+                    self.assertTrue(all(
+                        reference["finding_id"] in {
+                            finding["finding_id"]
+                            for finding in empty_dossier[
+                                "contextual_analysis"
+                            ]["findings"]
+                        }
+                        for reference in empty_traceability[
+                            "finding_references"
+                        ]
+                    ))
+                    self.assertTrue(any(
+                        reference.get("finding_id")
+                        for reference in empty_traceability["references"]
+                    ))
                     self.assertEqual(
                         empty_dossier["contextual_analysis"][
                             "cross_document_comparison_message"
@@ -1151,6 +1244,65 @@ class InvestigationTests(unittest.TestCase):
                     self.assertIn("LIMITATIONS", report_text)
                     self.assertIn(disclaimer_finding["finding_id"], report_text)
 
+    def test_extracts_label_values_from_positioned_pdf_regions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "positioned_identity.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 70), "Applicant Name", fontsize=11)
+            page.insert_text((220, 70), "Asha Example", fontsize=11)
+            page.insert_text((72, 100), "Date of Birth:", fontsize=11)
+            page.insert_text((72, 115), "01/02/1990", fontsize=11)
+            page.insert_text((72, 145), "Document Number", fontsize=11)
+            page.insert_text((220, 145), "DOC-12345", fontsize=11)
+            page.insert_text((72, 175), "Address", fontsize=11)
+            page.insert_text((72, 190), "1 Example Street, Sample City", fontsize=11)
+            page.insert_text((72, 220), "Gender:", fontsize=11)
+            page.insert_text((220, 220), "Female", fontsize=11)
+            page.insert_text((72, 250), "Issue Date", fontsize=11)
+            page.insert_text((220, 250), "01/03/2020", fontsize=11)
+            page.insert_text((72, 280), "Expiry Date:", fontsize=11)
+            page.insert_text((220, 280), "01/03/2030", fontsize=11)
+            document.save(pdf_path)
+            document.close()
+
+            page_texts = main.extract_document_pages(pdf_path)
+            document_id = "synthetic-positioned-document"
+            fields = main.extract_structured_fields(
+                page_texts,
+                document_id=document_id
+            )
+
+        expected = {
+            "applicant_name": "Asha Example",
+            "date_of_birth": "01/02/1990",
+            "document_number": "DOC-12345",
+            "address": "1 Example Street, Sample City",
+            "gender": "Female",
+            "issue_date": "01/03/2020",
+            "expiry_date": "01/03/2030"
+        }
+        for field_name, expected_value in expected.items():
+            with self.subTest(field=field_name):
+                extracted = fields[field_name][0]
+                self.assertEqual(extracted["value"], expected_value)
+                self.assertEqual(extracted["document_id"], document_id)
+                self.assertEqual(extracted["page"], 1)
+                self.assertTrue(extracted["method"])
+                self.assertIsNotNone(extracted["bbox"])
+                self.assertEqual(
+                    extracted["coordinate_system"],
+                    "PDF points, origin at top left"
+                )
+                self.assertIn(
+                    extracted["association_method"],
+                    {
+                        "same_line",
+                        "adjacent_region_same_baseline",
+                        "adjacent_region_below_label"
+                    }
+                )
+
     def test_dossier_explicitly_reports_no_structured_fields(self):
         page_texts = [{
             "page": 1,
@@ -1160,6 +1312,16 @@ class InvestigationTests(unittest.TestCase):
         }]
         fields = main.extract_structured_fields(page_texts)
         self.assertEqual(fields, {})
+        self.assertTrue(all(
+            status["status"] == "not_extracted"
+            for status in main.build_field_extraction_status(fields).values()
+        ))
+        self.assertIn(
+            "does not establish",
+            main.build_field_extraction_status(fields)["applicant_name"][
+                "message"
+            ]
+        )
 
     def test_builds_dossier_with_conflict_and_audit_event(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1194,7 +1356,7 @@ class InvestigationTests(unittest.TestCase):
                 paths[document_ids[1]]: "Robert Example"
             }
 
-            def extracted_fields(page_texts):
+            def extracted_fields(page_texts, document_id=None):
                 path = next(
                     path for path, pages in pages_by_path.items()
                     if pages == page_texts
