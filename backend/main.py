@@ -12,7 +12,9 @@ from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from xml.sax.saxutils import escape
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dotenv import load_dotenv
+from functools import lru_cache
 
 import hashlib
 import hmac
@@ -22,6 +24,7 @@ import os
 import statistics
 import re
 import sqlite3
+import tempfile
 import unicodedata
 import base64
 from difflib import SequenceMatcher
@@ -59,7 +62,10 @@ bearer_token_scheme = HTTPBearer(auto_error=False)
 
 
 def _jwt_secret():
-    secret = os.environ.get("FORENSAI_JWT_SECRET", "")
+    secret = (
+        os.environ.get("FORENSAI_JWT_SECRET")
+        or os.environ.get("JWT_SECRET", "")
+    )
     secret_bytes = secret.encode("utf-8")
     if not secret.strip() or len(secret_bytes) < 32:
         raise HTTPException(
@@ -273,6 +279,9 @@ def issue_auth_response(user):
 async def lifespan(_app):
     try:
         _jwt_secret()
+        if s3_storage_enabled():
+            get_s3_client()
+        forensic_database.initialize_database()
     except HTTPException as error:
         raise RuntimeError(error.detail) from error
     yield
@@ -292,6 +301,71 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_request_upload_directory = ContextVar(
+    "forensai_request_upload_directory",
+    default=None
+)
+
+
+class RequestUploadWorkspaceMiddleware:
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.application(scope, receive, send)
+            return
+
+        with tempfile.TemporaryDirectory(prefix="forensai-request-") as path:
+            token = _request_upload_directory.set(Path(path))
+            try:
+                await self.application(scope, receive, send)
+            finally:
+                _request_upload_directory.reset(token)
+
+
+app.add_middleware(RequestUploadWorkspaceMiddleware)
+
+
+def _frontend_file(path):
+    frontend_root = FRONTEND_DIR.resolve()
+    try:
+        candidate = (frontend_root / path.lstrip("/")).resolve()
+        candidate.relative_to(frontend_root)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+@app.middleware("http")
+async def serve_frontend_and_api(request: Request, call_next):
+    path = request.scope["path"]
+    if path == "/api" or path.startswith("/api/"):
+        path = path[4:] or "/"
+        request.scope["path"] = path
+        request.scope["raw_path"] = path.encode("utf-8")
+        return await call_next(request)
+
+    frontend_ready = (FRONTEND_DIR / "index.html").is_file()
+    if frontend_ready and request.method in {"GET", "HEAD"}:
+        accepts_html = "text/html" in request.headers.get("accept", "")
+        if path == "/" and accepts_html:
+            return FileResponse(FRONTEND_DIR / "index.html")
+        frontend_file = _frontend_file(path)
+        if frontend_file:
+            return FileResponse(frontend_file)
+
+    response = await call_next(request)
+    if (
+        frontend_ready
+        and request.method == "GET"
+        and response.status_code == 404
+        and "text/html" in request.headers.get("accept", "")
+    ):
+        return FileResponse(FRONTEND_DIR / "index.html")
+    return response
 
 # =========================================================
 # 2. DIRECTORIES AND FILE CONFIGURATION
@@ -316,6 +390,8 @@ MAX_INVESTIGATION_DOCUMENTS = 10
 AUDIT_LOG = Path("audit_trail.jsonl")
 MAX_IMAGE_PIXELS = 40_000_000
 SUPPORTED_OCR_LANGUAGES = {"en", "hi", "kn"}
+FRONTEND_DIR = Path(__file__).resolve().parent / "static"
+STORAGE_BUCKET = os.environ.get("BUCKET_NAME") or os.environ.get("S3_BUCKET")
 DOCUMENT_TYPES = {
     "identity",
     "educational",
@@ -415,12 +491,107 @@ def validate_document_id(document_id):
         raise HTTPException(status_code=400, detail="Invalid document ID.")
 
 
+def upload_working_directory():
+    if s3_storage_enabled():
+        return _request_upload_directory.get() or UPLOAD_DIR
+    return UPLOAD_DIR
+
+
+def s3_storage_enabled():
+    return (
+        os.environ.get("FORENSAI_STORAGE_BACKEND", "").lower() == "s3"
+    )
+
+
+@lru_cache(maxsize=1)
+def get_s3_client():
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError as error:
+        raise RuntimeError(
+            "S3 storage requires the boto3 package."
+        ) from error
+
+    required = {
+        "AWS_ENDPOINT_URL_S3": os.environ.get("AWS_ENDPOINT_URL_S3"),
+        "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID"),
+        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        "AWS_REGION": os.environ.get("AWS_REGION")
+    }
+    missing = [name for name, value in required.items() if not value]
+    if not STORAGE_BUCKET or missing:
+        raise RuntimeError(
+            "S3 storage is not fully configured. Missing required "
+            "Antideploy bucket settings."
+        )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=required["AWS_ENDPOINT_URL_S3"],
+        aws_access_key_id=required["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=required["AWS_SECRET_ACCESS_KEY"],
+        region_name=required["AWS_REGION"],
+        config=Config(s3={"addressing_style": "path"})
+    )
+
+
+def upload_document_object(file_path, document_id, extension):
+    if not s3_storage_enabled():
+        return
+    with file_path.open("rb") as source:
+        get_s3_client().put_object(
+            Bucket=STORAGE_BUCKET,
+            Key=f"documents/{document_id}{extension}",
+            Body=source,
+            ContentType=ALLOWED_TYPES[extension]
+        )
+
+
+def delete_document_object(document_id, extension):
+    if not s3_storage_enabled():
+        return
+    get_s3_client().delete_object(
+        Bucket=STORAGE_BUCKET,
+        Key=f"documents/{document_id}{extension}"
+    )
+
+
 def find_uploaded_document(document_id):
     validate_document_id(document_id)
 
     for extension in ALLOWED_TYPES:
-        candidate = UPLOAD_DIR / f"{document_id}{extension}"
-        if candidate.is_file():
+        candidate = upload_working_directory() / f"{document_id}{extension}"
+        if s3_storage_enabled():
+            try:
+                from botocore.exceptions import BotoCoreError, ClientError
+            except ImportError as error:
+                raise RuntimeError(
+                    "S3 storage requires the boto3 package."
+                ) from error
+            try:
+                get_s3_client().download_file(
+                    STORAGE_BUCKET,
+                    f"documents/{document_id}{extension}",
+                    str(candidate)
+                )
+                return candidate
+            except (BotoCoreError, ClientError) as error:
+                if (
+                    isinstance(error, ClientError)
+                    and error.response.get("Error", {}).get("Code")
+                    in {"404", "NoSuchKey", "NotFound"}
+                ):
+                    continue
+                logger.exception(
+                    "Unable to retrieve stored document %s",
+                    document_id
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Document storage is temporarily unavailable."
+                ) from error
+        elif candidate.is_file():
             return candidate
 
     raise HTTPException(status_code=404, detail="Uploaded document not found.")
@@ -463,7 +634,7 @@ def get_original_filename(file_path):
     if document:
         return document["source_filename"]
 
-    metadata_path = UPLOAD_DIR / f"{file_path.stem}.json"
+    metadata_path = upload_working_directory() / f"{file_path.stem}.json"
     if not metadata_path.is_file():
         return file_path.name
 
@@ -1477,8 +1648,10 @@ async def upload_document(
 
     document_id = str(uuid4())
     safe_filename = f"{document_id}{extension}"
-    file_path = UPLOAD_DIR / safe_filename
-    metadata_path = UPLOAD_DIR / f"{document_id}.json"
+    working_directory = upload_working_directory()
+    working_directory.mkdir(parents=True, exist_ok=True)
+    file_path = working_directory / safe_filename
+    metadata_path = working_directory / f"{document_id}.json"
     file_path.write_bytes(content)
     try:
         source_filename = Path(file.filename or safe_filename).name
@@ -1495,6 +1668,7 @@ async def upload_document(
             ),
             encoding="utf-8"
         )
+        upload_document_object(file_path, document_id, extension)
         forensic_database.save_document({
             "document_id": document_id,
             "source_filename": source_filename,
@@ -1517,12 +1691,22 @@ async def upload_document(
         file_path.unlink()
         if metadata_path.exists():
             metadata_path.unlink()
+        if s3_storage_enabled():
+            delete_document_object(document_id, extension)
         raise
     except Exception as error:
         forensic_database.delete_document(document_id)
         file_path.unlink()
         if metadata_path.exists():
             metadata_path.unlink()
+        if s3_storage_enabled():
+            try:
+                delete_document_object(document_id, extension)
+            except Exception:
+                logger.exception(
+                    "Unable to clean up failed document object %s",
+                    document_id
+                )
         raise HTTPException(
             status_code=500,
             detail="Unable to save uploaded document and its audit metadata."

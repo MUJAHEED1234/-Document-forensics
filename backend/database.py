@@ -11,10 +11,78 @@ from pathlib import Path
 DATABASE_PATH = Path(
     os.environ.get("FORENSICAI_DB_PATH", "forensicai.sqlite3")
 )
+class PostgresConnection:
+    def __init__(self, connection):
+        self.connection = connection
+        import psycopg
+
+        self.integrity_error = psycopg.IntegrityError
+
+    def execute(self, query, parameters=()):
+        query = query.replace(
+            "email = ? COLLATE NOCASE",
+            "LOWER(email) = LOWER(?)"
+        )
+        query = query.replace("datetime('now')", "CURRENT_TIMESTAMP::text")
+        query = query.replace("?", "%s")
+        try:
+            return self.connection.execute(query, parameters)
+        except self.integrity_error as error:
+            raise sqlite3.IntegrityError(str(error)) from error
+
+    def executemany(self, query, parameters):
+        query = query.replace("?", "%s")
+        try:
+            return self.connection.cursor().executemany(query, parameters)
+        except self.integrity_error as error:
+            raise sqlite3.IntegrityError(str(error)) from error
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
 
 
 @contextmanager
 def connect(database_path=None):
+    use_postgres = (
+        database_path is None
+        and os.environ.get("FORENSAI_DATABASE_BACKEND", "").lower()
+        == "postgres"
+    )
+    if use_postgres:
+        database_url = os.environ.get("DATABASE_URL", "").strip()
+        if not database_url:
+            raise RuntimeError(
+                "FORENSAI_DATABASE_BACKEND=postgres requires DATABASE_URL."
+            )
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as error:
+            raise RuntimeError(
+                "PostgreSQL support requires the psycopg package."
+            ) from error
+        raw_connection = psycopg.connect(
+            database_url,
+            row_factory=dict_row,
+            connect_timeout=10
+        )
+        connection = PostgresConnection(raw_connection)
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return
+
     path = Path(database_path or DATABASE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
@@ -32,6 +100,14 @@ def connect(database_path=None):
 
 
 def initialize_database(database_path=None):
+    if (
+        database_path is None
+        and os.environ.get("FORENSAI_DATABASE_BACKEND", "").lower()
+        == "postgres"
+    ):
+        _initialize_postgres_database()
+        return
+
     with connect(database_path) as connection:
         connection.executescript(
             """
@@ -118,6 +194,111 @@ def initialize_database(database_path=None):
             "CREATE INDEX IF NOT EXISTS idx_investigations_owner "
             "ON investigations(owner_id)"
         )
+        _bootstrap_admin(connection)
+
+
+def _first_column_value(row):
+    return next(iter(row.values())) if isinstance(row, dict) else row[0]
+
+
+def _initialize_postgres_database():
+    schema_statements = (
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'investigator')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower
+        ON users (LOWER(email))
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS revoked_tokens (
+            token_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            expires_at BIGINT NOT NULL,
+            revoked_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+            document_id TEXT PRIMARY KEY,
+            source_filename TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            file_size_bytes BIGINT NOT NULL,
+            sha256 TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL,
+            processing_status TEXT NOT NULL DEFAULT 'uploaded',
+            classification_override TEXT,
+            owner_id TEXT REFERENCES users(user_id) ON DELETE SET NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS investigations (
+            investigation_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            dossier_json TEXT NOT NULL,
+            owner_id TEXT REFERENCES users(user_id) ON DELETE SET NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS investigation_documents (
+            investigation_id TEXT NOT NULL
+                REFERENCES investigations(investigation_id) ON DELETE CASCADE,
+            document_id TEXT NOT NULL REFERENCES documents(document_id),
+            PRIMARY KEY (investigation_id, document_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS audit_events (
+            event_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            investigation_id TEXT,
+            document_ids_json TEXT NOT NULL,
+            details_json TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS finding_reviews (
+            review_id BIGSERIAL PRIMARY KEY,
+            investigation_id TEXT NOT NULL
+                REFERENCES investigations(investigation_id) ON DELETE CASCADE,
+            finding_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reviewer TEXT,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            UNIQUE (investigation_id, finding_id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_investigation_documents_document
+        ON investigation_documents(document_id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp
+        ON audit_events(timestamp)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_investigations_owner
+        ON investigations(owner_id)
+        """
+    )
+
+    with connect() as connection:
+        for statement in schema_statements:
+            connection.execute(statement)
         _bootstrap_admin(connection)
 
 
@@ -399,9 +580,10 @@ def list_users(database_path=None):
 def count_active_admins(database_path=None):
     initialize_database(database_path)
     with connect(database_path) as connection:
-        return connection.execute(
+        row = connection.execute(
             "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1"
-        ).fetchone()[0]
+        ).fetchone()
+    return _first_column_value(row)
 
 
 def update_user(user_id, role=None, is_active=None, database_path=None):
@@ -501,7 +683,7 @@ def get_dashboard_summary(user_id=None, is_admin=True, database_path=None):
             """,
             parameters
         ).fetchall()
-        analyzed_document_count = connection.execute(
+        analyzed_count_row = connection.execute(
             f"""
             SELECT COUNT(DISTINCT document_id)
             FROM investigation_documents
@@ -510,7 +692,8 @@ def get_dashboard_summary(user_id=None, is_admin=True, database_path=None):
             {"AND documents.owner_id = ?" if not is_admin else ""}
             """,
             (() if is_admin else (user_id,))
-        ).fetchone()[0]
+        ).fetchone()
+        analyzed_document_count = _first_column_value(analyzed_count_row)
 
     review_statuses = {
         (row["investigation_id"], row["finding_id"]): row["status"]

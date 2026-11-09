@@ -1710,6 +1710,55 @@ class InvestigationTests(unittest.TestCase):
                     "verified_by_investigator"
                 )
 
+    def test_serves_frontend_and_preserves_authenticated_api_routes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            frontend = root / "static"
+            assets = frontend / "assets"
+            assets.mkdir(parents=True)
+            (frontend / "index.html").write_text(
+                "<!doctype html><title>FORENSAI</title>",
+                encoding="utf-8"
+            )
+            (assets / "app.js").write_text(
+                "console.log('FORENSAI');",
+                encoding="utf-8"
+            )
+
+            with (
+                patch.object(main, "FRONTEND_DIR", frontend),
+                patch.object(
+                    main.forensic_database,
+                    "DATABASE_PATH",
+                    root / "forensicai.sqlite3"
+                ),
+                TestClient(main.app) as client
+            ):
+                page = client.get(
+                    "/",
+                    headers={"Accept": "text/html"}
+                )
+                self.assertEqual(page.status_code, 200)
+                self.assertIn("FORENSAI", page.text)
+
+                asset = client.get("/assets/app.js")
+                self.assertEqual(asset.status_code, 200)
+                self.assertIn("console.log", asset.text)
+
+                protected = client.get("/api/health")
+                self.assertEqual(protected.status_code, 401)
+                admin_headers = login_admin(client)
+                authenticated = client.get(
+                    "/api/health",
+                    headers=admin_headers
+                )
+                self.assertEqual(authenticated.status_code, 200)
+                legacy_route = client.get(
+                    "/health",
+                    headers=admin_headers
+                )
+                self.assertEqual(legacy_route.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

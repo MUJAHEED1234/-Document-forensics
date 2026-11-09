@@ -30,7 +30,8 @@ flowchart LR
 - **NumPy and Pillow**: image conversion and evidence-preview rendering.
 - **ReportLab**: PDF forensic report and investigation dossier generation.
 - **SHA-256**: source-file fingerprinting and traceability.
-- **SQLite**: saved investigations, document membership, review decisions, and audit history.
+- **SQLite locally, PostgreSQL in the deployment container**: saved investigations, document membership, review decisions, and audit history.
+- **Local filesystem locally, private S3-compatible object storage in deployment**: uploaded source documents.
 
 The prototype uses deterministic heuristics; it does not call an LLM or claim standards certification.
 
@@ -50,9 +51,8 @@ From the project root:
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r backend\requirements.txt
-Copy-Item backend\.env.example .env
 $jwtSecret = py -c "import secrets; print(secrets.token_urlsafe(48))"
-(Get-Content .env) -replace '^FORENSAI_JWT_SECRET=.*$', "FORENSAI_JWT_SECRET=$jwtSecret" | Set-Content .env
+Add-Content .env "FORENSAI_JWT_SECRET=$jwtSecret"
 Remove-Variable jwtSecret
 notepad .env
 python backend\main.py
@@ -69,6 +69,19 @@ npm run dev
 ```
 
 By default, the browser sends API calls to the frontend's own `/api` path, and the Vite development server proxies them to `http://127.0.0.1:8000`. This works when opening the frontend via localhost or the computer's LAN IP without making the backend publicly accessible. To proxy to another backend, set `FORENSAI_BACKEND_URL` before starting Vite. For a separately hosted frontend/API, set `VITE_API_BASE_URL` to the reachable API URL and configure that API's allowed CORS origin.
+
+## Antideploy deployment
+
+The root `Dockerfile` builds the existing React app, runs FastAPI with PostgreSQL and S3 support, and uses Nginx to serve the SPA and proxy same-origin `/api/*` requests to the existing API routes. The container listens on Antideploy's `PORT` (default `8080`) and exposes `GET /healthz`. The backend can also serve the built SPA directly if packaged under `backend/static`; `npm run build:antideploy` creates that ignored fallback build from the frontend directory. Configure these values through Antideploy's environment/secrets settings, not in source control:
+
+- `DATABASE_URL`
+- `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and `BUCKET_NAME` (or `S3_BUCKET`)
+- `FORENSAI_ADMIN_EMAIL` and `FORENSAI_ADMIN_PASSWORD` for the initial administrator
+- `JWT_SECRET` is provided by Antideploy; `FORENSAI_JWT_SECRET` may be used instead when managing the secret explicitly
+
+Use the bucket privately. The application preserves its local SQLite/filesystem defaults outside the deployment environment. Never include `.env`, local databases, uploads, reports, or credentials in a deployment archive.
+
+Run backend tests from the project root with `python -m unittest discover -s backend\tests -v`, and build the frontend from `ai-document-forensics-react` with `npm run build`.
 
 ## Prototype capabilities
 
@@ -102,7 +115,7 @@ By default, the browser sends API calls to the frontend's own `/api` path, and t
 - Cross-document name similarity is a basic string comparison, not semantic identity resolution. It can miss legitimate spelling variants or flag unrelated names; review source evidence.
 - The risk score is an ordering aid derived from finding severities, not a probability or fraud determination. A reviewer should inspect every cited source region.
 - No LLM-based contextual reasoning, external identity verification, multi-language recognition, or calibrated ML model is implemented.
-- Uploads and generated PDFs are local filesystem artifacts; investigation metadata, account records, ownership, reviews, and token revocations are stored in SQLite. Existing ownerless records are assigned to the configured bootstrap administrator at database initialization; without that administrator they remain inaccessible to investigator accounts. This local prototype does not provide encryption at rest, retention controls, registration rate limits, or production-grade access governance. Do not use real sensitive documents unless authorized and appropriately protected.
+- In local mode, uploads and generated PDFs are local filesystem artifacts and investigation metadata, account records, ownership, reviews, and token revocations are stored in SQLite. The deployment container uses PostgreSQL for metadata and private S3-compatible storage for uploaded source documents. Existing ownerless records are assigned to the configured bootstrap administrator at database initialization; without that administrator they remain inaccessible to investigator accounts. The project does not provide encryption-at-rest or retention controls for local artifacts, registration rate limits, or production-grade access governance. Do not use real sensitive documents unless authorized and appropriately protected.
 - Only use authorized documents and datasets. Keep a human reviewer responsible for consequential decisions. This project does not claim formal compliance with ISO/IEC or NIST frameworks.
 
 No genuine or real-customer dataset is bundled. Use synthetic or otherwise authorized sample documents for demonstrations; do not use real customer records without authorization.
